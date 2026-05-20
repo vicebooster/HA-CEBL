@@ -17,6 +17,34 @@ def _normalize_team_name(team_name):
     """Normalize team names so selections survive numeric ID changes."""
     return re.sub(r"[^a-z0-9]+", "", (team_name or "").lower())
 
+def _team_name_from_entry_title(entry):
+    """Extract the selected team name from older config entry titles."""
+    if entry.title.startswith("CEBL - "):
+        return entry.title.removeprefix("CEBL - ")
+    return None
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Migrate older config entries to include stable selected team names."""
+    if entry.version > 2:
+        return False
+
+    data = dict(entry.data)
+    teams = [str(team_id) for team_id in data.get("teams", [])]
+    team_names = dict(data.get("team_names", {}))
+    fallback_team_name = _team_name_from_entry_title(entry)
+
+    if fallback_team_name:
+        for team_id in teams:
+            team_names.setdefault(team_id, fallback_team_name)
+
+    data["teams"] = teams
+    if team_names:
+        data["team_names"] = team_names
+
+    hass.config_entries.async_update_entry(entry, data=data, version=2)
+    _LOGGER.debug("Migrated CEBL config entry %s to version 2", entry.entry_id)
+    return True
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up CEBL from a config entry."""
     _LOGGER.info(STARTUP_MESSAGE)
@@ -49,9 +77,12 @@ class CEBLDataUpdateCoordinator(DataUpdateCoordinator):
         self.selected_team_names = {
             _normalize_team_name(name) for name in self.team_names.values() if name
         }
-        if not self.selected_team_names and entry.title.startswith("CEBL - "):
-            self.selected_team_names.add(_normalize_team_name(entry.title.removeprefix("CEBL - ")))
+        if not self.selected_team_names:
+            fallback_team_name = _team_name_from_entry_title(entry)
+            if fallback_team_name:
+                self.selected_team_names.add(_normalize_team_name(fallback_team_name))
         self.match_ids = {}  # Store match IDs for live scores
+        self.final_stats_fetched = set()
         _LOGGER.info(f"Initializing CEBLDataUpdateCoordinator with teams: {self.teams}")
         super().__init__(
             hass,
@@ -164,6 +195,38 @@ class CEBLDataUpdateCoordinator(DataUpdateCoordinator):
             # Return empty data for unexpected errors to prevent complete failure
             return {"fixtures": []}
 
+    def _latest_completed_fixture_id(self, fixtures):
+        """Return the latest completed fixture ID from the filtered fixture list."""
+        from datetime import datetime
+        import pytz
+
+        latest_fixture = None
+        latest_start_time = None
+
+        for fixture in fixtures:
+            if fixture.get('status', '').upper() not in ['POST', 'COMPLETE', 'COMPLETED', 'FINAL']:
+                continue
+
+            start_time_utc = fixture.get('start_time_utc', '')
+            if not start_time_utc:
+                continue
+
+            try:
+                if start_time_utc.endswith('Z'):
+                    start_time = datetime.fromisoformat(start_time_utc[:-1]).replace(tzinfo=pytz.UTC)
+                else:
+                    start_time = datetime.fromisoformat(start_time_utc).replace(tzinfo=pytz.UTC)
+                    if start_time.tzinfo is None:
+                        start_time = start_time.replace(tzinfo=pytz.UTC)
+            except ValueError:
+                continue
+
+            if latest_start_time is None or start_time > latest_start_time:
+                latest_fixture = fixture
+                latest_start_time = start_time
+
+        return str(latest_fixture.get('id')) if latest_fixture else None
+
     async def async_update_live_scores(self, _):
         """Fetch live score data from the API using match IDs."""
         _LOGGER.info("Fetching live CEBL scores from API.")
@@ -174,6 +237,7 @@ class CEBLDataUpdateCoordinator(DataUpdateCoordinator):
             
         # Get current fixtures to check which games should have live data
         current_fixtures = self.data.get('fixtures', []) if self.data else []
+        latest_completed_fixture_id = self._latest_completed_fixture_id(current_fixtures)
         
         live_scores_data = {}
         
@@ -197,8 +261,9 @@ class CEBLDataUpdateCoordinator(DataUpdateCoordinator):
             
             if fixture_status in ['IN', 'LIVE', 'HT', 'BT']:  # Game is definitely live
                 should_fetch_live = True
-            elif fixture_status in ['POST', 'COMPLETE'] and start_time_utc:
-                # Fetch for completed games within the last 24 hours to get final stats
+            elif fixture_status in ['POST', 'COMPLETE', 'COMPLETED', 'FINAL'] and start_time_utc:
+                # Fetch recent completed games for final stats, and fetch the latest
+                # completed game once per runtime so dashboards can populate after restart.
                 try:
                     from datetime import datetime
                     import pytz
@@ -211,10 +276,15 @@ class CEBLDataUpdateCoordinator(DataUpdateCoordinator):
                     now = datetime.now(pytz.UTC)
                     hours_since_game = (now - fixture_dt).total_seconds() / 3600
                     
-                    # Fetch if game completed within last 24 hours
-                    if 0 <= hours_since_game <= 24:
+                    game_id_str = str(game_id)
+                    is_latest_completed = game_id_str == latest_completed_fixture_id
+
+                    if 0 <= hours_since_game <= 72:
                         should_fetch_live = True
                         _LOGGER.debug(f"Game {game_id} completed recently ({hours_since_game:.1f} hours ago), fetching final stats")
+                    elif is_latest_completed and game_id_str not in self.final_stats_fetched:
+                        should_fetch_live = True
+                        _LOGGER.debug(f"Game {game_id} is the latest completed game, fetching final stats once")
                     else:
                         _LOGGER.debug(f"Game {game_id} completed too long ago ({hours_since_game:.1f} hours), skipping live fetch")
                         
@@ -413,6 +483,8 @@ class CEBLDataUpdateCoordinator(DataUpdateCoordinator):
                                 "team1_coach": tm1.get('coach', ''),
                                 "team2_coach": tm2.get('coach', '')
                             }
+                            if fixture_status in ['POST', 'COMPLETE', 'COMPLETED', 'FINAL']:
+                                self.final_stats_fetched.add(str(game_id))
                             _LOGGER.debug(f"Updated comprehensive live data for game {game_id}: {tm1.get('name', 'Team1')} {tm1.get('score', 0)}-{tm2.get('score', 0)} {tm2.get('name', 'Team2')}")
                         
             except aiohttp.ClientError as err:
