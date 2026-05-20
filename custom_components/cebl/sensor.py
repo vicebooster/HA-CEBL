@@ -939,7 +939,7 @@ class CEBLTeamSensor(CEBLBaseSensor):
         self._attributes = {
             "team_id": self._team_id,
             "team_name": home_team['name'] if is_home_team else away_team['name'],
-            "team_logo": home_team.get('logo') or '',
+            "team_logo": (home_team.get('logo') or '') if is_home_team else (away_team.get('logo') or ''),
             "team_score": self._safe_score(home_team.get('score')) if is_home_team else self._safe_score(away_team.get('score')),
             "opponent_name": away_team['name'] if is_home_team else home_team['name'],
             "opponent_logo": (away_team.get('logo') or '') if is_home_team else (home_team.get('logo') or ''),
