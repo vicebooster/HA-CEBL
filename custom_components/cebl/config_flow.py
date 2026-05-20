@@ -22,8 +22,12 @@ class CEBLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             team_name = user_input["team"]
-            team_id = self.team_options_reverse[team_name]  # Get team ID from name
-            return self.async_create_entry(title=f"CEBL - {team_name}", data={"teams": [team_id]})
+            team = self.team_options_reverse[team_name]
+            team_id = str(team["id"])
+            return self.async_create_entry(
+                title=f"CEBL - {team_name}",
+                data={"teams": [team_id], "team_names": {team_id: team_name}},
+            )
 
         # Fetch teams dynamically
         teams = await self._fetch_teams()
@@ -35,7 +39,7 @@ class CEBLConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         teams.sort(key=lambda team: team["name"])
 
         self.team_options = {str(team["id"]): team["name"] for team in teams}  # Ensure team IDs are strings
-        self.team_options_reverse = {v: k for k, v in self.team_options.items()}  # Reverse map for lookups
+        self.team_options_reverse = {team["name"]: team for team in teams}  # Reverse map for lookups
 
         schema = vol.Schema({
             vol.Required("team"): vol.In(list(self.team_options.values())),  # Correctly handle team options

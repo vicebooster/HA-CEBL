@@ -2,6 +2,7 @@ import logging
 import aiohttp
 import asyncio
 import async_timeout
+import re
 from datetime import timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -11,6 +12,10 @@ from homeassistant.helpers.event import async_track_time_interval
 from .const import DOMAIN, API_URL_FIXTURES, API_URL_LIVE_BASE, API_HEADERS, PLATFORMS, STARTUP_MESSAGE
 
 _LOGGER = logging.getLogger(__name__)
+
+def _normalize_team_name(team_name):
+    """Normalize team names so selections survive numeric ID changes."""
+    return re.sub(r"[^a-z0-9]+", "", (team_name or "").lower())
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up CEBL from a config entry."""
@@ -39,7 +44,13 @@ class CEBLDataUpdateCoordinator(DataUpdateCoordinator):
         self.url_fixtures = API_URL_FIXTURES
         self.url_live_base = API_URL_LIVE_BASE
         self.headers = API_HEADERS
-        self.teams = entry.data.get("teams", [])
+        self.teams = {str(team_id) for team_id in entry.data.get("teams", [])}
+        self.team_names = entry.data.get("team_names", {})
+        self.selected_team_names = {
+            _normalize_team_name(name) for name in self.team_names.values() if name
+        }
+        if not self.selected_team_names and entry.title.startswith("CEBL - "):
+            self.selected_team_names.add(_normalize_team_name(entry.title.removeprefix("CEBL - ")))
         self.match_ids = {}  # Store match IDs for live scores
         _LOGGER.info(f"Initializing CEBLDataUpdateCoordinator with teams: {self.teams}")
         super().__init__(
@@ -79,20 +90,30 @@ class CEBLDataUpdateCoordinator(DataUpdateCoordinator):
                             # Handle both old and new API field formats
                             home_team_id = str(game.get("home_team_id", "") or game.get("hometeamId", ""))
                             away_team_id = str(game.get("away_team_id", "") or game.get("awayteamId", ""))
+                            home_team_name = game.get("home_team_name", "") or game.get("homename", "")
+                            away_team_name = game.get("away_team_name", "") or game.get("awayname", "")
+                            home_team_match = (
+                                home_team_id in self.teams
+                                or _normalize_team_name(home_team_name) in self.selected_team_names
+                            )
+                            away_team_match = (
+                                away_team_id in self.teams
+                                or _normalize_team_name(away_team_name) in self.selected_team_names
+                            )
                             
-                            if home_team_id in self.teams or away_team_id in self.teams:
+                            if home_team_match or away_team_match:
                                 # Convert to expected fixture format - handle both API formats
                                 fixture = {
                                     "id": game.get("id") or game.get("matchId"),
                                     "homeTeam": {
                                         "id": home_team_id,
-                                        "name": game.get("home_team_name", "") or game.get("homename", ""),
+                                        "name": home_team_name,
                                         "logo": game.get("home_team_logo_url", "") or game.get("homelogo", ""),
                                         "score": game.get("home_team_score", 0) or game.get("homescore", 0)
                                     },
                                     "awayTeam": {
                                         "id": away_team_id,
-                                        "name": game.get("away_team_name", "") or game.get("awayname", ""),
+                                        "name": away_team_name,
                                         "logo": game.get("away_team_logo_url", "") or game.get("awaylogo", ""),
                                         "score": game.get("away_team_score", 0) or game.get("awayscore", 0)
                                     },
@@ -160,7 +181,7 @@ class CEBLDataUpdateCoordinator(DataUpdateCoordinator):
             # Find the corresponding fixture to check if game should be live
             fixture = None
             for f in current_fixtures:
-                if f.get('id') == int(game_id):
+                if str(f.get('id')) == str(game_id):
                     fixture = f
                     break
             

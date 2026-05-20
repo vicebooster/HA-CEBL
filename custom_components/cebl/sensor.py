@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from homeassistant.helpers.entity import Entity
@@ -14,6 +15,10 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
+def _normalize_team_name(team_name):
+    """Normalize team names so selections survive numeric ID changes."""
+    return re.sub(r"[^a-z0-9]+", "", (team_name or "").lower())
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up CEBL sensors based on a config entry."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
@@ -22,20 +27,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     
     # Get teams from config
     teams = entry.data.get("teams", [])
+    team_names = entry.data.get("team_names", {})
     
     # Create one comprehensive sensor per team
     for team_id in teams:
-        entities.append(CEBLTeamSensor(hass, coordinator, team_id))
+        team_name = team_names.get(str(team_id))
+        if not team_name and entry.title.startswith("CEBL - "):
+            team_name = entry.title.removeprefix("CEBL - ")
+        entities.append(CEBLTeamSensor(hass, coordinator, team_id, team_name))
     
     async_add_entities(entities, update_before_add=False)
 
 class CEBLBaseSensor(CoordinatorEntity, SensorEntity):
     """Base class for CEBL sensors."""
     
-    def __init__(self, hass: HomeAssistant, coordinator: DataUpdateCoordinator, team_id=None):
+    def __init__(self, hass: HomeAssistant, coordinator: DataUpdateCoordinator, team_id=None, team_name=None):
         super().__init__(coordinator)
         self.hass = hass
         self._team_id = str(team_id) if team_id else None
+        self._selected_team_name = team_name
+        self._selected_team_name_normalized = _normalize_team_name(team_name)
         self._state = None
         self._attributes = {}
         self._time_update_remover = None
@@ -214,10 +225,8 @@ class CEBLBaseSensor(CoordinatorEntity, SensorEntity):
         team_fixtures = []
         for fixture in fixtures:
             try:
-                home_team_id = str(fixture['homeTeam']['id'])
-                away_team_id = str(fixture['awayTeam']['id'])
-                
-                if home_team_id == self._team_id or away_team_id == self._team_id:
+                is_team_fixture, _ = self._get_fixture_team_context(fixture)
+                if is_team_fixture:
                     team_fixtures.append(fixture)
             except (KeyError, TypeError) as e:
                 _LOGGER.debug(f"Invalid fixture data: {e}")
@@ -312,6 +321,36 @@ class CEBLBaseSensor(CoordinatorEntity, SensorEntity):
         _LOGGER.debug("No categorized games found, returning first fixture")
         return team_fixtures[0]
 
+    def _get_fixture_team_context(self, fixture):
+        """Return whether the fixture contains the selected team and if it is home."""
+        home_team = fixture.get('homeTeam', {})
+        away_team = fixture.get('awayTeam', {})
+        home_team_id = str(home_team.get('id', ''))
+        away_team_id = str(away_team.get('id', ''))
+        home_team_name = _normalize_team_name(home_team.get('name', ''))
+        away_team_name = _normalize_team_name(away_team.get('name', ''))
+
+        is_home_team = (
+            home_team_id == self._team_id
+            or (
+                self._selected_team_name_normalized
+                and home_team_name == self._selected_team_name_normalized
+            )
+        )
+        is_away_team = (
+            away_team_id == self._team_id
+            or (
+                self._selected_team_name_normalized
+                and away_team_name == self._selected_team_name_normalized
+            )
+        )
+
+        if is_home_team:
+            return True, True
+        if is_away_team:
+            return True, False
+        return False, None
+
     def _get_team_live_data(self):
         """Get live data for this team."""
         data = self.coordinator.data
@@ -330,15 +369,13 @@ class CEBLBaseSensor(CoordinatorEntity, SensorEntity):
                 fixture = None
                 fixtures = data.get('fixtures', [])
                 for f in fixtures:
-                    if f.get('id') == int(game_id):
+                    if str(f.get('id')) == str(game_id):
                         fixture = f
                         break
                 
                 if fixture:
-                    home_team_id = str(fixture['homeTeam']['id'])
-                    away_team_id = str(fixture['awayTeam']['id'])
-                    
-                    if home_team_id == self._team_id or away_team_id == self._team_id:
+                    is_team_fixture, _ = self._get_fixture_team_context(fixture)
+                    if is_team_fixture:
                         return live_data, fixture
             except (KeyError, TypeError, ValueError) as e:
                 _LOGGER.debug(f"Error processing live data for game {game_id}: {e}")
@@ -349,8 +386,8 @@ class CEBLBaseSensor(CoordinatorEntity, SensorEntity):
 class CEBLTeamSensor(CEBLBaseSensor):
     """Sensor for team information and statistics."""
     
-    def __init__(self, hass: HomeAssistant, coordinator: DataUpdateCoordinator, team_id):
-        super().__init__(hass, coordinator, team_id)
+    def __init__(self, hass: HomeAssistant, coordinator: DataUpdateCoordinator, team_id, team_name=None):
+        super().__init__(hass, coordinator, team_id, team_name)
         
         # Get team name for proper entity naming
         self._team_name = self._get_team_name_from_data()
@@ -367,17 +404,18 @@ class CEBLTeamSensor(CEBLBaseSensor):
             for fixture in fixtures:
                 home_team = fixture.get('homeTeam', {})
                 away_team = fixture.get('awayTeam', {})
+                is_team_fixture, is_home_team = self._get_fixture_team_context(fixture)
                 
-                if str(home_team.get('id')) == self._team_id:
+                if is_team_fixture and is_home_team:
                     return home_team.get('name', f'Team {self._team_id}')
-                elif str(away_team.get('id')) == self._team_id:
+                elif is_team_fixture:
                     return away_team.get('name', f'Team {self._team_id}')
             
             # Fallback - try to extract from team ID mapping
-            return f'Team {self._team_id}'
+            return self._selected_team_name or f'Team {self._team_id}'
         except Exception as e:
             _LOGGER.debug(f"Error getting team name for {self._team_id}: {e}")
-            return f'Team {self._team_id}'
+            return self._selected_team_name or f'Team {self._team_id}'
     
     def _create_team_slug(self, team_name):
         """Create a valid entity ID slug from team name."""
@@ -574,7 +612,9 @@ class CEBLTeamSensor(CEBLBaseSensor):
             if 'homeTeam' in game_data and 'awayTeam' in game_data:
                 home_team = game_data['homeTeam']
                 away_team = game_data['awayTeam']
-                is_home_team = str(home_team['id']) == self._team_id
+                _, is_home_team = self._get_fixture_team_context(game_data)
+                if is_home_team is None:
+                    is_home_team = str(home_team['id']) == self._team_id
                 
                 # Use API live field as primary indicator
                 is_live_from_api = game_data.get('live', 0) == 1
@@ -625,18 +665,15 @@ class CEBLTeamSensor(CEBLBaseSensor):
                 if fixture:
                     home_team_name = fixture.get('homeTeam', {}).get('name', '')
                     away_team_name = fixture.get('awayTeam', {}).get('name', '')
-                    home_team_id = str(fixture.get('homeTeam', {}).get('id', ''))
-                    away_team_id = str(fixture.get('awayTeam', {}).get('id', ''))
+                    is_team_fixture, is_home_team = self._get_fixture_team_context(fixture)
                     
                     # Determine which team we are tracking
-                    if self._team_id == home_team_id:
+                    if is_team_fixture and is_home_team:
                         our_team_name = home_team_name
                         opponent_name = away_team_name
-                        is_home_team = True
-                    elif self._team_id == away_team_id:
+                    elif is_team_fixture:
                         our_team_name = away_team_name
                         opponent_name = home_team_name
-                        is_home_team = False
                     else:
                         # Fallback if team ID doesn't match
                         is_home_team = True
@@ -799,8 +836,9 @@ class CEBLTeamSensor(CEBLBaseSensor):
                     # Determine team-relative names
                     home_team_name = fixture.get('homeTeam', {}).get('name', '')
                     away_team_name = fixture.get('awayTeam', {}).get('name', '')
-                    home_team_id = str(fixture.get('homeTeam', {}).get('id', ''))
-                    is_home_team = home_team_id == self._team_id
+                    _, is_home_team = self._get_fixture_team_context(fixture)
+                    if is_home_team is None:
+                        is_home_team = False
                     
                     self._attributes.update({
                         'game_date': fixture.get('start_time_utc', ''),
@@ -819,8 +857,7 @@ class CEBLTeamSensor(CEBLBaseSensor):
                 # Add team stats if available
                 if self._state == "POST":
                     # Extract top scorer for completed games
-                    home_team_id = str(fixture.get('homeTeam', {}).get('id', '')) if fixture else None
-                    our_is_home = home_team_id == self._team_id if home_team_id else None
+                    _, our_is_home = self._get_fixture_team_context(fixture) if fixture else (False, None)
                     
                     if our_is_home is not None:
                         top_scorer = self._extract_top_scorer(game_data, our_is_home)
@@ -855,7 +892,9 @@ class CEBLTeamSensor(CEBLBaseSensor):
         """Update state with fixture data only."""
         home_team = fixture['homeTeam']
         away_team = fixture['awayTeam']
-        is_home_team = str(home_team['id']) == self._team_id
+        _, is_home_team = self._get_fixture_team_context(fixture)
+        if is_home_team is None:
+            is_home_team = str(home_team['id']) == self._team_id
         
         # Parse start time
         start_time_utc = dt.parse_datetime(fixture.get('start_time_utc', ''))

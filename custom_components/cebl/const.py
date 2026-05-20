@@ -5,7 +5,7 @@ PLATFORMS = ["sensor"]
 STARTUP_MESSAGE = "Starting CEBL integration"
 
 # New API URLs
-API_URL_FIXTURES = "https://api.data.cebl.ca/games/2025/"
+API_URL_FIXTURES = "https://api.data.cebl.ca/games/active/"
 API_URL_LIVE_BASE = "https://fibalivestats.dcd.shared.geniussports.com/data/competition/"
 
 # Required headers for CEBL API
